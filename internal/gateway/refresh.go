@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -29,8 +30,13 @@ func (g *Gateway) syncProxyResult(ctx context.Context, proxy *proxyTransport, st
 		g.verifyProxyAfterError(ctx, proxy, status)
 		return true
 	}
+	// 收到直连的 HTTP 响应已证明连通性；模型错误不触发异站探测或换 IP。
+	if err == nil && proxy.direct != nil && status >= 100 && status < 600 {
+		proxy.swapHealthy(true)
+		return false
+	}
 	if status >= 200 && status < 400 {
-		wasHealthy := proxy.healthy.Swap(true)
+		wasHealthy := proxy.swapHealthy(true)
 		if !wasHealthy {
 			g.restoreProxy(proxy)
 		}
@@ -54,7 +60,11 @@ func (g *Gateway) verifyProxyAfterError(ctx context.Context, proxy *proxyTranspo
 	// running. Keep its values but give the proxy check an independent timeout.
 	checkCtx := context.WithoutCancel(ctx)
 	go func() {
-		result := g.transports.checkClaimedProxy(checkCtx, proxy, proxyHealthCheckURL, proxyHealthCheckTimeout)
+		target := proxyHealthCheckURL
+		if proxy.direct != nil {
+			target = strings.TrimRight(g.cfg.Upstream.Zen, "/") + "/v1/models"
+		}
+		result := g.transports.checkClaimedProxy(checkCtx, proxy, target, proxyHealthCheckTimeout)
 		g.applyProxyHealthResult(result, "upstream HTTP response", status)
 	}()
 }
@@ -63,7 +73,7 @@ func (g *Gateway) rebindFailedProxy(proxy *proxyTransport) (zenMoved, goMoved in
 	if proxy == nil {
 		return 0, 0
 	}
-	wasHealthy := proxy.healthy.Swap(false)
+	wasHealthy := proxy.swapHealthy(false)
 	return g.rebindUnavailableProxy(proxy, wasHealthy)
 }
 
@@ -184,7 +194,7 @@ func (g *Gateway) refreshProtocolCapabilities(ctx context.Context) (modelcatalog
 	}
 	var lastErr error
 	for _, proxy := range g.transports.items {
-		if proxy == nil || !proxy.healthy.Load() {
+		if proxy == nil || !proxy.available() {
 			continue
 		}
 		capabilities, err := modelcatalog.FetchCapabilities(ctx, proxy.client, modelcatalog.CapabilitiesURL)

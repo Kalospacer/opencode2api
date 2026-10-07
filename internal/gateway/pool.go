@@ -22,24 +22,29 @@ import (
 )
 
 type proxyTransport struct {
-	index    int
-	name     string
-	client   *http.Client
-	healthy  atomic.Bool
-	checking atomic.Bool
+	index          int
+	name           string
+	client         *http.Client
+	healthy        atomic.Bool
+	checking       atomic.Bool
+	direct         *directState
+	rateLimitUntil atomic.Int64
 }
 
 type transportPool struct {
-	items []*proxyTransport
+	ordered bool
+	items   []*proxyTransport
 }
 
 // anonymousPool gives the shared OpenCode "public" credential an independent
 // cooldown per proxy. Unlike key nodes, anonymous nodes are never rebound:
 // changing proxy is the failover mechanism because Zen rate-limits them by IP.
 type anonymousPool struct {
-	nodes    []*anonymousNode
-	next     atomic.Uint64
-	cooldown time.Duration
+	ordered     bool
+	directIndex int
+	nodes       []*anonymousNode
+	next        atomic.Uint64
+	cooldown    time.Duration
 }
 
 type anonymousNode struct {
@@ -49,18 +54,25 @@ type anonymousNode struct {
 }
 
 type anonymousCursor struct {
-	pool   *anonymousPool
-	start  int
-	offset int
+	pool          *anonymousPool
+	start         int
+	offset        int
+	directVisited bool
 }
 
 func newAnonymousPool(enabled bool, transports *transportPool, cooldown time.Duration) *anonymousPool {
-	pool := &anonymousPool{cooldown: cooldown}
+	pool := &anonymousPool{cooldown: cooldown, directIndex: -1}
+	if transports != nil {
+		pool.ordered = transports.ordered
+	}
 	if !enabled || transports == nil {
 		return pool
 	}
 	pool.nodes = make([]*anonymousNode, 0, len(transports.items))
 	for _, proxy := range transports.items {
+		if proxy.direct != nil {
+			pool.directIndex = len(pool.nodes)
+		}
 		pool.nodes = append(pool.nodes, &anonymousNode{proxy: proxy})
 	}
 	return pool
@@ -75,6 +87,10 @@ func (p *anonymousPool) Len() int {
 
 func (p *anonymousPool) CursorFor(affinity string) anonymousCursor {
 	if p == nil || len(p.nodes) == 0 {
+		return anonymousCursor{pool: p}
+	}
+	// 测速管理器把最快节点写在文件前面；ordered 模式不再用哈希打乱起点。
+	if p.ordered {
 		return anonymousCursor{pool: p}
 	}
 	start := 0
@@ -93,11 +109,20 @@ func (c *anonymousCursor) Next() *anonymousNode {
 	if c.pool == nil || len(c.pool.nodes) == 0 {
 		return nil
 	}
+	if !c.directVisited {
+		c.directVisited = true
+		if c.pool.directIndex >= 0 {
+			node := c.pool.nodes[c.pool.directIndex]
+			if node.proxy.available() {
+				return node
+			}
+		}
+	}
 	now := time.Now().UnixNano()
 	for c.offset < len(c.pool.nodes) {
 		node := c.pool.nodes[(c.start+c.offset)%len(c.pool.nodes)]
 		c.offset++
-		if node.proxy.healthy.Load() && node.cooldownUntil.Load() <= now {
+		if node.proxy.direct == nil && node.proxy.available() && node.cooldownUntil.Load() <= now {
 			return node
 		}
 	}
@@ -116,7 +141,9 @@ func (p *anonymousPool) MarkFailure(node *anonymousNode, resp *http.Response, er
 	if node == nil {
 		return
 	}
-	if err == nil && resp != nil && resp.StatusCode != http.StatusUnauthorized && resp.StatusCode != http.StatusForbidden && resp.StatusCode != http.StatusTooManyRequests && resp.StatusCode < 500 {
+	// 上游模型的 5xx 不代表该出口无法调用其他模型。
+	// 本次请求仍会轮换节点，但只对限流、认证拒绝或网络错误整体冷却。
+	if err == nil && resp != nil && resp.StatusCode != http.StatusUnauthorized && resp.StatusCode != http.StatusForbidden && resp.StatusCode != http.StatusTooManyRequests {
 		return
 	}
 	failures := node.failures.Add(1)
@@ -131,7 +158,7 @@ func (p *anonymousPool) MarkFailure(node *anonymousNode, resp *http.Response, er
 
 func (p *transportPool) hasHealthy() bool {
 	for _, proxy := range p.items {
-		if proxy.healthy.Load() {
+		if proxy.isHealthy() {
 			return true
 		}
 	}
@@ -143,7 +170,7 @@ func (p *transportPool) healthCounts() (total, healthy int) {
 		return 0, 0
 	}
 	for _, proxy := range p.items {
-		if proxy.healthy.Load() {
+		if proxy.isHealthy() {
 			healthy++
 		}
 	}
@@ -151,7 +178,7 @@ func (p *transportPool) healthCounts() (total, healthy int) {
 }
 
 func newTransportPool(proxies []string, cfg config.PerformanceConfig, responseHeaderTimeout time.Duration) (*transportPool, error) {
-	p := &transportPool{items: make([]*proxyTransport, 0, len(proxies))}
+	p := &transportPool{ordered: cfg.ProxySelection == "ordered", items: make([]*proxyTransport, 0, len(proxies))}
 	for _, raw := range proxies {
 		transport := http.DefaultTransport.(*http.Transport).Clone()
 		transport.MaxIdleConns = cfg.MaxIdleConns
@@ -175,6 +202,10 @@ func newTransportPool(proxies []string, cfg config.PerformanceConfig, responseHe
 		}
 		proxy := &proxyTransport{index: len(p.items), name: raw, client: &http.Client{Transport: transport}}
 		proxy.healthy.Store(true)
+		if raw == "direct" {
+			proxy.direct = &directState{}
+			proxy.direct.healthy.Store(true)
+		}
 		p.items = append(p.items, proxy)
 	}
 	return p, nil
@@ -195,12 +226,12 @@ func (p *transportPool) CheckHealth(ctx context.Context, target string, timeout 
 	results := make(chan proxyHealthResult, len(p.items))
 	checks := 0
 	for _, proxy := range p.items {
-		if proxy.healthy.Load() || !proxy.checking.CompareAndSwap(false, true) {
+		if proxy.isHealthy() || !proxy.checking.CompareAndSwap(false, true) {
 			continue
 		}
 		// A real request may have restored the proxy between the first health
 		// read and claiming this check.
-		if proxy.healthy.Load() {
+		if proxy.isHealthy() {
 			proxy.checking.Store(false)
 			continue
 		}
@@ -231,12 +262,12 @@ func (p *transportPool) checkClaimedProxy(ctx context.Context, proxy *proxyTrans
 			_ = resp.Body.Close()
 		}
 	}
-	result := proxyHealthResult{proxy: proxy, err: err, wasHealthy: proxy.healthy.Load()}
+	result := proxyHealthResult{proxy: proxy, err: err, wasHealthy: proxy.isHealthy()}
 	if err == nil {
-		result.wasHealthy = proxy.healthy.Swap(true)
+		result.wasHealthy = proxy.swapHealthy(true)
 	} else if isProxyFailure(err) {
 		result.failed = true
-		result.wasHealthy = proxy.healthy.Swap(false)
+		result.wasHealthy = proxy.swapHealthy(false)
 	}
 	return result
 }
@@ -349,11 +380,22 @@ func (p *nodePool) Proxy(node *upstreamNode) *proxyTransport {
 	if p == nil || node == nil || p.transports == nil {
 		return nil
 	}
-	index := int(node.proxyIndex.Load())
-	if index < 0 || index >= len(p.transports.items) {
-		return nil
+	if direct := p.transports.directNode(); direct != nil && direct.available() {
+		return direct
 	}
-	return p.transports.items[index]
+	index := int(node.proxyIndex.Load())
+	if !p.transports.ordered && index >= 0 && index < len(p.transports.items) {
+		proxy := p.transports.items[index]
+		if proxy.direct == nil && proxy.available() {
+			return proxy
+		}
+	}
+	for _, proxy := range p.transports.items {
+		if proxy.direct == nil && proxy.available() {
+			return proxy
+		}
+	}
+	return nil
 }
 
 // RebindProxy moves every key currently using failedProxy to the least-loaded
@@ -393,7 +435,7 @@ func (p *nodePool) replacementLocked(failedProxy int, healthyOnly bool) int {
 	minimum := int(^uint(0) >> 1)
 	candidates := make([]int, 0, len(p.transports.items)-1)
 	for i := range p.transports.items {
-		if i == failedProxy || healthyOnly && !p.transports.items[i].healthy.Load() {
+		if i == failedProxy || healthyOnly && !p.transports.items[i].available() {
 			continue
 		}
 		count := p.bindingCount[i]

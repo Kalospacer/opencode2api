@@ -64,7 +64,7 @@ func NewRuntimeManager(root context.Context, configPath string, cfg config.Confi
 		}
 		clients := make([]*http.Client, 0, len(runtime.gateway.transports.items))
 		for _, proxy := range runtime.gateway.transports.items {
-			if proxy != nil && proxy.healthy.Load() {
+			if proxy != nil && proxy.available() {
 				clients = append(clients, proxy.client)
 			}
 		}
@@ -184,6 +184,7 @@ func (m *RuntimeManager) Apply(candidate config.Config, persist bool) (ApplyResu
 	}
 	if current != nil {
 		next.gateway.catalog.CopyState(current.gateway.catalog)
+		next.gateway.inheritDirectState(current.gateway)
 	}
 	if persist || hadPlaintextPassword {
 		if err := config.SaveAtomic(m.configPath, normalized); err != nil {
@@ -254,13 +255,14 @@ type KeyStatus struct {
 }
 
 type ProxyStatus struct {
-	Index     int    `json:"index"`
-	Address   string `json:"address"`
-	Healthy   bool   `json:"healthy"`
-	Checking  bool   `json:"checking"`
-	ZenKeys   int    `json:"zen_keys"`
-	GoKeys    int    `json:"go_keys"`
-	Anonymous bool   `json:"anonymous"`
+	Index         int        `json:"index"`
+	Address       string     `json:"address"`
+	Healthy       bool       `json:"healthy"`
+	Checking      bool       `json:"checking"`
+	ZenKeys       int        `json:"zen_keys"`
+	GoKeys        int        `json:"go_keys"`
+	Anonymous     bool       `json:"anonymous"`
+	CooldownUntil *time.Time `json:"cooldown_until,omitempty"`
 }
 
 func (m *RuntimeManager) Resources() ResourceSnapshot {
@@ -281,7 +283,15 @@ func (m *RuntimeManager) Resources() ResourceSnapshot {
 	goBindings := append([]int(nil), gateway.goNodes.bindingCount...)
 	gateway.goNodes.bindingsMu.Unlock()
 	for _, proxy := range gateway.transports.items {
-		status := ProxyStatus{Index: proxy.index, Address: config.RedactURL(proxy.name), Healthy: proxy.healthy.Load(), Checking: proxy.checking.Load(), Anonymous: gateway.cfg.Anonymous}
+		status := ProxyStatus{Index: proxy.index, Address: config.RedactURL(proxy.name), Healthy: proxy.isHealthy(), Checking: proxy.checking.Load(), Anonymous: gateway.cfg.Anonymous}
+		if proxy.direct != nil && proxy.direct.cooldownUntil.Load() > time.Now().UnixNano() {
+			until := time.Unix(0, proxy.direct.cooldownUntil.Load()).UTC()
+			status.CooldownUntil = &until
+		}
+		if untilValue := proxy.rateLimitUntil.Load(); untilValue > time.Now().UnixNano() {
+			until := time.Unix(0, untilValue).UTC()
+			status.CooldownUntil = &until
+		}
 		if proxy.index < len(zenBindings) {
 			status.ZenKeys = zenBindings[proxy.index]
 		}

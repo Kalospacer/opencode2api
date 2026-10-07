@@ -199,6 +199,7 @@ $("#config-form").addEventListener("submit", async (event) => {
         effort_by_model: JSON.parse($("#c-reasoning-by-model").value || "{}"),
       },
       performance: {
+        proxy_selection: config.performance.proxy_selection || "affinity",
         max_idle_conns: number("#c-idle"),
         max_idle_conns_per_host: number("#c-idle-host"),
         max_conns_per_host: number("#c-max-host"),

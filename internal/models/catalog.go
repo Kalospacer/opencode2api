@@ -28,6 +28,11 @@ type Route struct {
 	// always start on Zen, then enter this list when the public credential does
 	// not succeed.
 	KeyTiers []config.Tier
+	// BackendSelector 非空时要求上游响应的第一个 SSE data 块 id
+	// 以此前缀开头，否则断开重试。仅对 exo-free 的虚拟子模型生效。
+	BackendSelector string
+	// UpstreamModel 是发往上游的实际模型名。虚拟子模型时与 ID 不同。
+	UpstreamModel string
 }
 
 type RouteDiagnostic struct {
@@ -197,21 +202,38 @@ func (c *Catalog) Route(model string, hasZenKeys, hasGoKeys, hasAnonymous bool) 
 }
 
 func (c *Catalog) routeLocked(model string, hasZenKeys, hasGoKeys, hasAnonymous bool) (Route, error) {
-	keyTiers := c.keyTierOrderLocked(model, hasZenKeys, hasGoKeys)
+	base, selector := splitVirtualModel(model)
+	keyTiers := c.keyTierOrderLocked(base, hasZenKeys, hasGoKeys)
 	// OpenCode's public credential is a Zen-only lane. Every free model starts
 	// there, even if the current catalog only advertises it on Go: an upstream
 	// rejection will move the request into the authenticated fallback plan.
-	decision := c.anonymousDecision(model)
-	if hasAnonymous && decision.Allowed && (c.protocols[model] != "" || !c.unsupported[config.TierZen][model]) &&
-		(len(c.zen) == 0 && len(c.goModels) == 0 || c.zen[model] || c.goModels[model]) {
-		protocols := c.protocolsForLocked(model, keyTiers, true)
-		return Route{ID: model, Tier: config.TierZen, Protocol: protocols[config.TierZen], Protocols: protocols, Anonymous: true, KeyTiers: keyTiers}, nil
+	decision := c.anonymousDecision(base)
+	if hasAnonymous && decision.Allowed && (c.protocols[base] != "" || !c.unsupported[config.TierZen][base]) &&
+		(len(c.zen) == 0 && len(c.goModels) == 0 || c.zen[base] || c.goModels[base]) {
+		protocols := c.protocolsForLocked(base, keyTiers, true)
+		return Route{
+			ID: model, Tier: config.TierZen, Protocol: protocols[config.TierZen],
+			Protocols: protocols, Anonymous: true, KeyTiers: keyTiers,
+			BackendSelector: selector, UpstreamModel: upstreamModelFor(model, base),
+		}, nil
 	}
 	if len(keyTiers) > 0 {
-		protocols := c.protocolsForLocked(model, keyTiers, false)
-		return Route{ID: model, Tier: keyTiers[0], Protocol: protocols[keyTiers[0]], Protocols: protocols, KeyTiers: keyTiers}, nil
+		protocols := c.protocolsForLocked(base, keyTiers, false)
+		return Route{
+			ID: model, Tier: keyTiers[0], Protocol: protocols[keyTiers[0]],
+			Protocols: protocols, KeyTiers: keyTiers,
+			BackendSelector: selector, UpstreamModel: upstreamModelFor(model, base),
+		}, nil
 	}
 	return Route{}, fmt.Errorf("model %q is not available in the configured Zen or Go pools", model)
+}
+
+// upstreamModelFor 返回发往上游的实际模型名。虚拟子模型返回基础模型名。
+func upstreamModelFor(virtual, base string) string {
+	if virtual != base {
+		return base
+	}
+	return ""
 }
 
 func (r Route) ProtocolFor(tier config.Tier) wire.Protocol {
@@ -233,10 +255,11 @@ func (c *Catalog) protocolsForLocked(model string, keyTiers []config.Tier, inclu
 }
 
 func (c *Catalog) protocolForLocked(model string, tier config.Tier) wire.Protocol {
-	if protocol := c.protocols[model]; protocol != "" {
+	base, _ := splitVirtualModel(model)
+	if protocol := c.protocols[base]; protocol != "" {
 		return protocol
 	}
-	if protocol := c.nativeProtocols[tier][model]; protocol != "" {
+	if protocol := c.nativeProtocols[tier][base]; protocol != "" {
 		return protocol
 	}
 	// The OpenCode capability catalog is authoritative when available. Chat is
@@ -250,13 +273,14 @@ func (c *Catalog) protocolForLocked(model string, tier config.Tier) wire.Protoco
 // successful catalog refresh, configured key pools remain usable so temporary
 // discovery failures do not take the gateway offline.
 func (c *Catalog) keyTierOrderLocked(model string, hasZenKeys, hasGoKeys bool) []config.Tier {
+	base, _ := splitVirtualModel(model)
 	catalogPending := len(c.zen) == 0 && len(c.goModels) == 0
 	available := func(tier config.Tier) bool {
 		switch tier {
 		case config.TierZen:
-			return hasZenKeys && (catalogPending || c.zen[model]) && c.tierSupportedLocked(model, config.TierZen)
+			return hasZenKeys && (catalogPending || c.zen[base]) && c.tierSupportedLocked(model, config.TierZen)
 		case config.TierGo:
-			return hasGoKeys && (catalogPending || c.goModels[model]) && c.tierSupportedLocked(model, config.TierGo)
+			return hasGoKeys && (catalogPending || c.goModels[base]) && c.tierSupportedLocked(model, config.TierGo)
 		default:
 			return false
 		}
@@ -291,10 +315,11 @@ func (c *Catalog) RouteForTier(model string, tier config.Tier, hasZenKeys, hasGo
 	}
 	c.mu.RLock()
 	defer c.mu.RUnlock()
+	base, selector := splitVirtualModel(model)
 	catalogPending := len(c.zen) == 0 && len(c.goModels) == 0
-	advertised := c.zen[model]
+	advertised := c.zen[base]
 	if tier == config.TierGo {
-		advertised = c.goModels[model]
+		advertised = c.goModels[base]
 	}
 	if !catalogPending && !advertised {
 		return Route{}, fmt.Errorf("model %q is not available in the selected %s key tier", model, tier)
@@ -305,14 +330,16 @@ func (c *Catalog) RouteForTier(model string, tier config.Tier, hasZenKeys, hasGo
 	protocol := c.protocolForLocked(model, tier)
 	return Route{
 		ID: model, Tier: tier, Protocol: protocol,
-		Protocols: map[config.Tier]wire.Protocol{tier: protocol},
-		KeyTiers:  []config.Tier{tier},
+		Protocols:       map[config.Tier]wire.Protocol{tier: protocol},
+		KeyTiers:        []config.Tier{tier},
+		BackendSelector: selector, UpstreamModel: upstreamModelFor(model, base),
 	}, nil
 }
 
 func (c *Catalog) anonymousDecision(model string) AnonymousDecision {
+	base, _ := splitVirtualModel(model)
 	if c.pricing != nil {
-		return c.pricing.Decide(model)
+		return c.pricing.Decide(base)
 	}
 	return AnonymousDecision{Allowed: isFreeModel(model), Source: "name_fallback_metadata_pending"}
 }
@@ -328,14 +355,15 @@ func (c *Catalog) IsFreeModel(model string) bool {
 
 func (c *Catalog) Diagnostic(model string, requested wire.Protocol, hasZenKeys, hasGoKeys, hasAnonymous bool) RouteDiagnostic {
 	c.mu.RLock()
-	configured, explicit := c.protocols[model]
-	zen, goModel := c.zen[model], c.goModels[model]
+	base, _ := splitVirtualModel(model)
+	configured, explicit := c.protocols[base]
+	zen, goModel := c.zen[base], c.goModels[base]
 	nativeProtocols := map[config.Tier]wire.Protocol{
 		config.TierZen: c.protocolForLocked(model, config.TierZen),
 		config.TierGo:  c.protocolForLocked(model, config.TierGo),
 	}
-	_, zenKnown := c.nativeProtocols[config.TierZen][model]
-	_, goKnown := c.nativeProtocols[config.TierGo][model]
+	_, zenKnown := c.nativeProtocols[config.TierZen][base]
+	_, goKnown := c.nativeProtocols[config.TierGo][base]
 	c.mu.RUnlock()
 	source := "configured"
 	if !explicit {
@@ -369,8 +397,24 @@ func (c *Catalog) Diagnostic(model string, requested wire.Protocol, hasZenKeys, 
 	return diagnostic
 }
 
+// splitVirtualModel 将 "exo-free-claude" / "exo-free-gpt" 拆分为基础模型和
+// 期望后端前缀。非虚拟模型返回原始 ID 和空选择器。
+func splitVirtualModel(model string) (base string, selector string) {
+	switch model {
+	case "exo-free-claude":
+		return "exo-free", "msg_"
+	case "exo-free-gpt":
+		return "exo-free", "resp_"
+	}
+	return model, ""
+}
+
+// virtualModelSuffixes 列出所有虚拟子模型的后缀，用于在模型列表中展开。
+var virtualModelSuffixes = []string{"-claude", "-gpt"}
+
 func isFreeModel(model string) bool {
-	return strings.Contains(strings.ToLower(model), "free")
+	base, _ := splitVirtualModel(model)
+	return strings.Contains(strings.ToLower(base), "free")
 }
 
 func (c *Catalog) List() []string {
@@ -393,6 +437,12 @@ func (c *Catalog) modelIDsLocked() []string {
 	}
 	for model := range c.goModels {
 		seen[model] = true
+	}
+	// 为 exo-free 的每个后端提供可选择的虚拟子模型。
+	if seen["exo-free"] {
+		for _, suffix := range virtualModelSuffixes {
+			seen["exo-free"+suffix] = true
+		}
 	}
 	return sortedSetKeys(seen)
 }
@@ -456,30 +506,33 @@ func (c *Catalog) Supported(model string) bool {
 func (c *Catalog) MetadataForTier(model string, tier config.Tier) Metadata {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.modelMeta[tier][model]
+	base, _ := splitVirtualModel(model)
+	return c.modelMeta[tier][base]
 }
 
 func (c *Catalog) supportedLocked(model string) bool {
+	base, _ := splitVirtualModel(model)
 	if len(c.zen) == 0 && len(c.goModels) == 0 {
 		return true
 	}
-	if c.zen[model] && c.tierSupportedLocked(model, config.TierZen) {
+	if c.zen[base] && c.tierSupportedLocked(model, config.TierZen) {
 		return true
 	}
-	if c.goModels[model] && c.tierSupportedLocked(model, config.TierGo) {
+	if c.goModels[base] && c.tierSupportedLocked(model, config.TierGo) {
 		return true
 	}
 	return false
 }
 
 func (c *Catalog) tierSupportedLocked(model string, tier config.Tier) bool {
-	if c.protocols[model] != "" {
+	base, _ := splitVirtualModel(model)
+	if c.protocols[base] != "" {
 		return true
 	}
-	if c.unsupported[tier][model] {
+	if c.unsupported[tier][base] {
 		return false
 	}
-	if c.nativeProtocols[tier][model] != "" {
+	if c.nativeProtocols[tier][base] != "" {
 		return true
 	}
 	// A pending catalog has no upstream capability snapshot to contradict a

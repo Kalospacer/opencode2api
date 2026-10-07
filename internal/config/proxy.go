@@ -23,10 +23,7 @@ func resolveProxyFiles(configPath string, cfg *Config) error {
 		effective = append(effective, proxies...)
 	}
 
-	effective = uniqueStrings(effective)
-	if len(effective) == 0 {
-		effective = []string{"direct"}
-	}
+	effective = directFirstProxies(effective)
 	cfg.effectiveProxies = effective
 	return nil
 }
@@ -87,4 +84,16 @@ func trimList(items *[]string) {
 		}
 	}
 	*items = out
+}
+
+// directFirstProxies 默认补入优先级 0 的直连，保留其他代理的原有排序并去重。
+func directFirstProxies(proxies []string) []string {
+	result := make([]string, 0, len(proxies)+1)
+	result = append(result, "direct")
+	for _, proxy := range proxies {
+		if proxy != "direct" {
+			result = append(result, proxy)
+		}
+	}
+	return uniqueStrings(result)
 }

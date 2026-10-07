@@ -192,17 +192,31 @@ Eligibility is a routing decision; the upstream can still reject or rate-limit t
 
 The routing sequence is:
 
-1. For an eligible model, try each available anonymous proxy once.
+1. For an eligible model, try direct access first. Enter the proxy fallback pool only while direct access is cooling after HTTP 429 or has a real connection failure. Each node is attempted at most once, up to `retry.max_attempts` attempts.
 2. Try authenticated tiers in `prefer` order, using only tiers with a configured key and a route for that model.
 3. Apply `retry.max_attempts` separately to each authenticated tier.
 
-Anonymous attempts are not cut short by `retry.max_attempts`, but all attempts share the request timeout. Network errors, authentication failures, rate limits, and server errors can rotate keys. Other 4xx responses end the current tier; another available tier may still be tried.
+Anonymous attempts are bounded by `retry.max_attempts`, and all attempts share the request timeout. Network errors, authentication failures, rate limits, and server errors can rotate keys. Other 4xx responses end the current tier; another available tier may still be tried.
 
 Requests are encoded for each tier's own protocol. Once a stream has started, the gateway does not retry generation on another node. A recognized stale Responses reasoning reference can trigger one repair pass; selected-key diagnostics never use that replay.
 
 When only anonymous access is configured, `/v1/models` exposes only models eligible for that lane.
 
+### exo-free backend aliases
+
+When the upstream catalog exposes a routable `exo-free`, the gateway also exposes `exo-free-claude` and `exo-free-gpt`. The original `exo-free` remains unchanged. Both aliases send `exo-free` as the upstream model.
+
+Before sending a response downstream, aliases inspect the first complete SSE data event containing a top-level `id`. The Claude alias requires `msg_`; the GPT alias requires `resp_`. Heartbeats and events without an ID are skipped during inspection, and all original stream bytes are preserved.
+
+An incorrect or unverifiable backend is closed immediately. A subsequent attempt uses a new upstream session and `x-opencode-request`, while the local request ID remains stable. Backend selection, anonymous proxy rotation and authenticated fallback share one actual-request budget of `retry.max_attempts`. Selected-key diagnostics make only one attempt. Exhaustion returns HTTP 502 with `backend_selection_failed`, never an unchecked or incorrect backend success. Non-2xx upstream errors retain their status.
+
+These ID prefixes identify response sources, not specific model versions or guaranteed availability. Session replacement may reduce prompt-cache hits.
+
 ### Sessions and proxies
+
+The runtime always inserts one `direct` node at index 0. Anonymous and authenticated inference prefer that node while it is reachable and outside cooldown. Direct HTTP 429 triggers cooldown using the existing failure delay and any longer `Retry-After`; requests then use backup proxies within the existing attempt budget. Direct connection failures also permit fallback. Other direct HTTP errors, including 400, 401, 403 and 503, end the current lane rather than changing IPs. Exit rate limits do not penalize an otherwise valid authentication key.
+
+Direct availability and cooldown are shared across hot reloads in the same process, so subscription updates cannot clear a pending cooldown. In-flight success cannot clear a later 429 cooldown. Process restart clears in-memory state. Management monitoring exposes the direct node at index 0 and its `cooldown_until` when active.
 
 Keys are initially spread across proxies. Real traffic can trigger proxy checks, key rebinding, and cooldowns. Unhealthy proxies are rechecked every 15 minutes against Cloudflare trace.
 
@@ -281,6 +295,8 @@ direct
 Comment markers are `#`, `;`, and `//` at the start of a line or after whitespace.
 
 ### Timeouts and connection pools
+
+`performance.proxy_selection` accepts `affinity` (default backup proxy affinity) or `ordered` (backup proxies prioritized by file order). Both modes prefer direct access. Once fallback is needed, `ordered` prioritizes the fastest available proxy in the latency-ranked file; cooling or unhealthy nodes are skipped. See the [server-side proxy pool deployment guide](tools/proxy_pool/README.md) for subscription discovery, periodic checks, eviction and non-disruptive publication.
 
 | Field                                   | Default | Meaning                                                |
 | --------------------------------------- | ------- | ------------------------------------------------------ |

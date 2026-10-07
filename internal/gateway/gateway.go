@@ -176,6 +176,10 @@ func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 				wire.WriteError(w, external, http.StatusGatewayTimeout, "upstream request timed out", "upstream_timeout", ids.Request)
 				return
 			}
+			if errors.Is(err, errBackendSelection) {
+				wire.WriteError(w, external, http.StatusBadGateway, err.Error(), "backend_selection_failed", ids.Request)
+				return
+			}
 			wire.WriteError(w, external, http.StatusBadGateway, "all upstream attempts failed", "upstream_error", ids.Request)
 			return
 		}
@@ -404,6 +408,10 @@ func (g *Gateway) prepareRouteBodies(from wire.Protocol, route models.Route, inp
 				continue
 			}
 			return nil, fmt.Errorf("prepare %s upstream request: %w", tier, err)
+		}
+		// 虚拟子模型向上游发送基础模型 ID，后端选择后缀仅在网关内部使用。
+		if route.UpstreamModel != "" {
+			upstreamPayload["model"] = route.UpstreamModel
 		}
 		if effort := g.cfg.ForcedEffort(jsonutil.StringAt(upstreamPayload, "model")); effort != "" {
 			wire.ForcedEffort(protocol, upstreamPayload, effort)

@@ -52,7 +52,7 @@ func debugKeyOverrideFrom(ctx context.Context) (DebugKeyOverride, bool) {
 	return override, ok && override.KeyID != ""
 }
 
-func (g *Gateway) doUpstream(ctx context.Context, route models.Route, bodies map[config.Tier][]byte, ids identity.RequestIDs) (*http.Response, models.Route, error) {
+func (g *Gateway) doUpstreamWithReasoningRetry(ctx context.Context, route models.Route, bodies map[config.Tier][]byte, ids identity.RequestIDs) (*http.Response, models.Route, error) {
 	resp, effectiveRoute, attempts, err := g.doUpstreamTiers(ctx, route, bodies, ids, 0)
 	if _, selected := debugKeyOverrideFrom(ctx); selected {
 		return resp, effectiveRoute, err
@@ -180,6 +180,9 @@ func (g *Gateway) doUpstreamTiers(ctx context.Context, route models.Route, bodie
 	var lastResponse *http.Response
 	var lastErr error
 	effectiveRoute := route
+	if budget := attemptBudget(ctx); budget != nil {
+		attemptOffset = budget.used
+	}
 	attempts := attemptOffset
 	g.dumpOutboundBodies(route, bodies, ids, attemptOffset)
 	if override, selected := debugKeyOverrideFrom(ctx); selected {
@@ -215,6 +218,9 @@ func (g *Gateway) doUpstreamTiers(ctx context.Context, route models.Route, bodie
 		keyTiers = []config.Tier{route.Tier}
 	}
 	for _, tier := range keyTiers {
+		if budget := attemptBudget(ctx); budget != nil && budget.used >= budget.limit {
+			break
+		}
 		if lastResponse != nil {
 			httpx.DrainAndClose(lastResponse.Body)
 			lastResponse = nil
@@ -240,15 +246,13 @@ func (g *Gateway) doUpstreamTiers(ctx context.Context, route models.Route, bodie
 	return nil, effectiveRoute, attempts, lastErr
 }
 
-// doAnonymousUpstream tries every currently available proxy at most once. Any
-// failure, including an HTTP error response, advances to the next proxy. Only a
-// successful response ends the anonymous phase; exhausting the proxy cursor
-// returns control to the preferred authenticated tiers.
+// doAnonymousUpstream 在配置次数内轮换可用节点，每个节点最多尝试一次。
+// 429、服务端或网络错误切换节点；请求参数错误结束当前通道。
 func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, bodies map[config.Tier][]byte, ids identity.RequestIDs, attemptOffset int) (*http.Response, error, int) {
 	var lastResponse *http.Response
 	var lastErr error
 	cursor := g.anonymous.CursorFor(ids.Session)
-	limit := g.anonymous.Len()
+	limit := min(g.anonymous.Len(), g.cfg.Retry.MaxAttempts)
 	attempts := 0
 	body := bodies[config.TierZen]
 	if len(body) == 0 {
@@ -272,6 +276,10 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 		}
 		node := cursor.Next()
 		if node == nil {
+			break
+		}
+		if !attemptBudget(ctx).take() {
+			lastErr = errAttemptBudget
 			break
 		}
 		attempts++
@@ -306,6 +314,9 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 		if err == nil && resp.StatusCode/100 == 2 {
 			g.logger.Debug("anonymous upstream accepted request", "component", "upstream", "event", "anonymous_attempt_succeeded", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", config.RedactURL(node.proxy.name), "status", resp.StatusCode, "duration_ms", duration.Milliseconds())
 			return resp, nil, attempts
+		}
+		if directResponseEndsLane(node.proxy, resp, err) || isNonRetryableClientResponse(resp, err) {
+			return resp, err, attempts
 		}
 		lastResponse = resp
 		lastErr = err
@@ -582,6 +593,9 @@ func (g *Gateway) doSelectedKeyUpstream(ctx context.Context, route models.Route,
 	if err != nil {
 		return nil, err, 0
 	}
+	if !attemptBudget(ctx).take() {
+		return nil, errAttemptBudget, 0
+	}
 	started := time.Now()
 	resp, err := proxy.client.Do(req)
 	duration := time.Since(started)
@@ -629,6 +643,10 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route models.Route, bodies 
 		if node == nil {
 			break
 		}
+		if !attemptBudget(ctx).take() {
+			lastErr = errAttemptBudget
+			break
+		}
 		attempts++
 		// Keep the request-level trace synchronized with the attempt that is
 		// about to be sent. Only the redacted key suffix is retained.
@@ -671,6 +689,9 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route models.Route, bodies 
 			g.logger.Debug("upstream accepted request", "component", "upstream", "event", "attempt_succeeded", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "key_id", keyID, "proxy", config.RedactURL(proxy.name), "status", resp.StatusCode, "duration_ms", attemptDuration.Milliseconds())
 			return resp, nil, attempts
 		}
+		if directResponseEndsLane(proxy, resp, err) {
+			return resp, err, attempts
+		}
 		// Request-shape errors are deterministic and must leave this tier without
 		// rotating through unrelated keys. The outer route may still try the next
 		// tier in prefer order. Authentication, throttling, server, and transport
@@ -700,6 +721,16 @@ func (g *Gateway) observeKeyResult(ctx context.Context, nodes *nodePool, node *u
 		return
 	}
 	status := upstreamStatus(resp)
+	if proxy.direct != nil {
+		g.observeDirectResult(ctx, proxy, resp, err)
+		if err != nil || status == http.StatusTooManyRequests {
+			return
+		}
+	}
+	if err == nil && status == http.StatusTooManyRequests {
+		g.coolFallbackProxy(proxy, resp)
+		return
+	}
 	proxyFailed := g.syncProxyResult(ctx, proxy, status, err)
 	if err == nil && status/100 == 2 || isNonRetryableClientResponse(resp, err) {
 		nodes.MarkSuccess(node)
@@ -715,7 +746,15 @@ func (g *Gateway) observeAnonymousResult(ctx context.Context, node *anonymousNod
 		return
 	}
 	status := upstreamStatus(resp)
-	g.syncProxyResult(ctx, node.proxy, status, err)
+	if node.proxy.direct != nil {
+		g.observeDirectResult(ctx, node.proxy, resp, err)
+		return
+	}
+	if err == nil && status == http.StatusTooManyRequests {
+		g.coolFallbackProxy(node.proxy, resp)
+	} else {
+		g.syncProxyResult(ctx, node.proxy, status, err)
+	}
 	if err == nil && status/100 == 2 {
 		g.anonymous.MarkSuccess(node)
 	} else {
@@ -754,6 +793,12 @@ func requestCredential(ctx context.Context) (string, string, bool) {
 }
 
 func (g *Gateway) recordUpstreamAttempt(ctx context.Context, route models.Route, ids identity.RequestIDs, attempt int, keyID, channel string, anonymous bool, proxy *proxyTransport, resp *http.Response, err error, duration time.Duration) {
+	if budget := attemptBudget(ctx); budget != nil {
+		attempt = budget.used
+		if meta := telemetry.MetaFromContext(ctx); meta != nil {
+			meta.Attempts = attempt
+		}
+	}
 	status := upstreamStatus(resp)
 	success := err == nil && status >= 200 && status < 300
 	outcome := "retryable_failure"
@@ -798,7 +843,12 @@ func newUpstreamRequest(ctx context.Context, baseURL string, protocol wire.Proto
 	// older Zen deployments continue to recognize the request.
 	req.Header.Set("x-session-affinity", ids.Session)
 	req.Header.Set("X-Session-Id", ids.Session)
-	req.Header.Set("x-opencode-request", ids.Request)
+	requestID := ids.Request
+	if attemptBudget(ctx) != nil {
+		// 上游每次使用新的关联标识，本地监控仍保留原始 request_id。
+		requestID = identity.RandomID("req", 16)
+	}
+	req.Header.Set("x-opencode-request", requestID)
 	req.Header.Set("x-opencode-project", ids.Project)
 	if ids.ParentSession != "" {
 		req.Header.Set("x-parent-session-id", ids.ParentSession)
